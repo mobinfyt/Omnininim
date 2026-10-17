@@ -28,9 +28,7 @@ ARG NODE_DIST_URL=
 # that already have a fix published in trixie. CVEs without an upstream fix yet
 # (local-only TOCTOU, etc.) remain until the distro patches them and the image
 # is rebuilt; none are reachable from the proxy's request surface at runtime.
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-lists,target=/var/lib/apt/lists,sharing=locked \
-  sed -i -E "s|https?://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+RUN sed -i -E "s|https?://deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
   && if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi \
   && apt-get update \
   && apt-get upgrade -y \
@@ -91,9 +89,7 @@ ENV NEXT_TELEMETRY_DISABLED=1
 
 # Build tools for native module compilation
 # apt-get update needed here because base's rm -rf clears the shared cache
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-lists,target=/var/lib/apt/lists,sharing=locked \
-  apt-get update \
+RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
 
@@ -127,8 +123,7 @@ RUN test -f package-lock.json \
 # node-gyp comes from npm's own bundled copy (deterministic, already in the image)
 # instead of `npx --yes`, which would install an arbitrary registry version
 # on-demand and run its lifecycle scripts (Sonar docker:S6505).
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-npm-cache,target=/root/.npm \
-  npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
+RUN npm ci --include=optional --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && (cd node_modules/better-sqlite3 \
       && if [ -n "${NODE_DIST_URL}" ]; then export NODEJS_ORG_MIRROR="${NODE_DIST_URL}"; fi \
       && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild --force_build=1) \
@@ -212,27 +207,11 @@ ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 # step with `ResourceExhausted: ... cannot allocate memory`. The compile phase
 # always finished ("✓ Compiled successfully in 4.2min"); the kernel killed the
 # build right after "Collecting page data using N workers".
-#
-# #11419's first fix (8 → 3) modeled the per-worker peak as an INFERENCE
-# (2560 MB, guessed from "7 workers didn't fit") and assumed the parent
-# process's RSS tracked the V8 heap ceiling. Both assumptions were wrong: a
-# live VPS reproduction (issue #7518, dmesg OOM-killer report) measured the
-# real per-process RSS directly at ~4.5 GB, independent of the NODE_OPTIONS
-# heap flag (Turbopack itself is native/Rust, outside the V8 heap) — and it
-# applies to the parent process too, not just workers. 2 workers (3 processes
-# × 4.5 GB = 13.5 GB) still didn't fit the 12.288 GB (75%) budget on a 16 GB
-# runner, matching the still-live publish failures after #11419 merged. 1
-# worker (2 processes × 4.5 GB = 9 GB) fits with headroom to spare.
-# tests/unit/docker-build-memory-budget.test.ts does the arithmetic against
-# the measured figure and fails if either knob is raised past what a 16 GB
-# runner holds. Override for a big builder: `--build-arg
-# OMNIROUTE_BUILD_WORKERS=8`.
 ARG OMNIROUTE_BUILD_WORKERS=2
 ENV CIRCLE_NODE_TOTAL=${OMNIROUTE_BUILD_WORKERS}
 
 COPY . ./
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-next-cache,target=/app/.build/next/cache \
-  mkdir -p /app/data \
+RUN mkdir -p /app/data \
   && npm run build \
   && node --input-type=module -e "import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url'; const standaloneRoot = '/app/.build/next/standalone/node_modules/'; const require = createRequire('/app/.build/next/standalone/package.json'); for (const pkg of ['@atjsh/llmlingua-2', '@huggingface/transformers', 'js-tiktoken']) { const resolved = require.resolve(pkg); if (!resolved.startsWith(standaloneRoot)) throw new Error(pkg + ' resolved outside standalone: ' + resolved); await import(pathToFileURL(resolved).href); } const onnxRuntime = require.resolve('onnxruntime-node'); if (!onnxRuntime.startsWith(standaloneRoot)) throw new Error('onnxruntime-node resolved outside standalone: ' + onnxRuntime); await import(pathToFileURL(onnxRuntime).href);"
 
@@ -245,100 +224,30 @@ LABEL org.opencontainers.image.title="omniroute" \
   org.opencontainers.image.source="https://github.com/diegosouzapw/OmniRoute" \
   org.opencontainers.image.licenses="MIT"
 
-ENV NODE_ENV=production
-ENV PORT=20128
-ENV HOSTNAME=0.0.0.0
-# Runtime heap ceiling. 1024MB is enough for normal traffic but can be tight
-# for large fusion-combo panels (many models fanned out in parallel, each
-# response buffered in full — see open-sse/services/fusion.ts::FUSION_DEFAULTS
-# .maxPanel, issue #1905). Override at `docker run` time with
-# `-e OMNIROUTE_MEMORY_MB=2048` (or higher) if you raise fusionTuning.maxPanel
-# above the default cap.
-ENV OMNIROUTE_MEMORY_MB=1024
+# Runtime heap. Separate from the build-time ceiling (OMNIROUTE_BUILD_MEMORY_MB)
+# so production containers can run on smaller plans.
+ARG OMNIROUTE_MEMORY_MB=2048
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
 
-# Data directory inside Docker — must match the volume mount in docker-compose.yml
-ENV DATA_DIR=/app/data
+# Production defaults. Overridable at runtime.
+ENV NODE_ENV=production \
+  OMNIROUTE_DATA_DIR=/app/data \
+  PORT=3000 \
+  HOSTNAME=0.0.0.0
+
+WORKDIR /app
+
+# Standalone output from Next.js (includes the server + traced deps).
+COPY --from=builder /app/.build/next/standalone ./
+COPY --from=builder /app/.build/next/static ./.build/next/static
+COPY --from=builder /app/public ./public
+
+# Ensure the data directory exists and is writable by the non-root user.
 RUN mkdir -p /app/data && chown node:node /app /app/data
 
-# #13679: default the PUBLISHED image to requiring an API key. A bare
-# `docker run -p 20128:20128 … diegosouzapw/omniroute` (README/QUICK-START
-# one-liners) does not pass `--env-file .env`, so without this default the
-# anonymous /v1 LLM proxy would be both keyless AND world-reachable on the
-# published container. This does NOT change the npm/CLI local-dev default
-# (`REQUIRE_API_KEY` stays `"false"` in featureFlagDefinitions.ts) — only the
-# shipped deployment artifact's posture. docker-compose.yml is unaffected: it
-# loads the operator's own `.env` (env_file:) which overrides this ENV, and
-# already binds loopback-only by default (#12568). Override with
-# `-e REQUIRE_API_KEY=false` for an intentionally keyless deployment.
-ENV REQUIRE_API_KEY=true
-
-# `npm run build` (build-next-isolated → assembleStandalone) bundles ALL runtime
-# files into .build/next/standalone/ — .next, node_modules, migrations, scripts,
-# docs, and the previously hand-COPY'd modules below (@swc/helpers, pino-*, split2,
-# migrations). assembleStandalone copies them straight from the builder's
-# node_modules, so they are present regardless of NFT/Turbopack trace behaviour.
-# The old per-module overrides were therefore pure duplication and were removed
-# (build-output-isolation cleanup). See scripts/build/assembleStandalone.mjs
-# (EXTRA_MODULE_ENTRIES) for the single source of truth.
-COPY --chown=node:node --from=builder /app/.build/next/standalone ./
-# better-sqlite3 is the one exception still copied explicitly: assembleStandalone
-# only syncs its native build/ dir; the JS wrapper (lib/, package.json) is left to
-# Next.js tracing. bootstrap-env requires SQLite BEFORE the standalone server
-# starts, so guarantee the complete package independent of trace behaviour.
-COPY --chown=node:node --from=builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
-RUN test -f /app/node_modules/better-sqlite3/build/Release/better_sqlite3.node
-# migrations land at <standalone>/migrations via assembleStandalone; point the runtime at them.
-ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
-
-# Docker healthcheck script — not traced by Next.js standalone output, so copy
-# it explicitly. The HEALTHCHECK CMD references it as `node healthcheck.mjs`.
-COPY --chown=node:node --from=builder /app/scripts/dev/healthcheck.mjs ./healthcheck.mjs
-
-# Every COPY above hands its files to the baked-in `node` non-root user
-# (UID/GID 1000) at copy time. Do NOT add a `RUN chown -R node:node /app`
-# afterwards: in the overlay filesystem changing ownership rewrites every file
-# into a new layer, which stored the ~2 GB standalone build twice (#13990).
-
-EXPOSE 20128
-
-# Drop to non-root before ENTRYPOINT/CMD so every derived stage (runner-cli,
-# runner-web) also runs as a non-root user unless they explicitly switch back.
-USER node
-
-# Warns if the mounted data volume has wrong ownership
-COPY --chmod=755 scripts/check-permissions.sh /app/check-permissions.sh
-ENTRYPOINT ["/app/check-permissions.sh"]
-
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["node", "healthcheck.mjs"]
-
-CMD ["node", "dev/run-standalone.mjs"]
-
-# ── Runner Web (web-cookie providers: Gemini Web, Claude Turnstile) ───────────
-#
-#  Two image flavors:
-#    runner-base  →  omniroute:VERSION        Lean base (~500 MB). No browsers.
-#    runner-web   →  omniroute:VERSION-web    +Chromium/Playwright (~800 MB).
-#
-#  Use runner-web when you need web-cookie providers (gemini-web, claude-web,
-#  claude-turnstile). For all other providers runner-base is sufficient.
-#
-#  Build:
-#    docker build --target runner-web -t omniroute:web .
-#  Compose:
-#    build:
-#      context: .
-#      target: runner-web
-FROM runner-base AS runner-web
-
-USER root
-
-# Copy playwright and playwright-core from the builder stage.
-# The slim runtime image does not have playwright in node_modules, so npx falls
-# back to a registry download — unreliable on CI runners (exits 127 on failure).
-# Copying from the builder avoids any network access at image-build time and also
-# ensures the same playwright version is available at runtime for web-session providers.
+# Playwright browsers (Chromium) for features that need a real browser.
+# The install happens under root so OS deps can be pulled; ownership is then
+# handed to the node user.
 COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
 COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
 
@@ -350,9 +259,7 @@ COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
 # browsers land under /home/node which persists across image layers and is
 # accessible to the non-root runtime user.
 ENV PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-lists,target=/var/lib/apt/lists,sharing=locked \
-  apt-get update \
+RUN apt-get update \
   && node node_modules/playwright/cli.js install chromium --with-deps \
   && apt-get install -y --no-install-recommends xvfb \
   && chown -R node:node /home/node/.cache \
@@ -373,9 +280,7 @@ COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-
 COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
 
 # Install system dependencies required by openclaw (git+ssh references).
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-lists,target=/var/lib/apt/lists,sharing=locked \
-  apt-get update \
+RUN apt-get update \
   && apt-get install -y --no-install-recommends git ca-certificates docker.io docker-compose \
   && rm -rf /var/lib/apt/lists/* \
   && git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"
@@ -392,8 +297,7 @@ RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-apt-cache,targe
 # this binary for WASM-signed Cosy auth; without it the executor's own
 # `cli_not_found` handling is correct but every PAT login fails with
 # `spawn qodercli ENOENT`. Same pinning rationale as the tools above.
-RUN --mount=type=cache,id=s/92ca8a61-c1ba-421f-a389-d48ac7258c2d-npm-cache,target=/root/.npm \
-  npm install -g --no-audit --no-fund \
+RUN npm install -g --no-audit --no-fund \
     @openai/codex@0.159.2 \
     @anthropic-ai/claude-code@2.1.260 \
     droid@0.212.0 \
